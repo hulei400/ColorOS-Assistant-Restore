@@ -100,6 +100,13 @@ final class SystemUiHooks {
     private static final String EXTRA_INVOCATION_TYPE = "invocation_type";
     private static final String SETTING_ASSISTANT = "assistant";
     private static final String SETTING_VOICE_INTERACTION_SERVICE = "voice_interaction_service";
+    /**
+     * Namespaced Secure setting that remembers the last assistant that successfully
+     * dispatched. The module's RemotePreferences are read-only inside hooked processes,
+     * so the component is kept here instead; it is only ever used to restore the
+     * system default when ColorOS loses it across a reboot.
+     */
+    private static final String SETTING_LAST_ASSISTANT = "assist_restore_last_assistant";
     private static final String ACTION_VOICE_INTERACTION_SERVICE =
             "android.service.voice.VoiceInteractionService";
 
@@ -146,6 +153,9 @@ final class SystemUiHooks {
 
     static void install(AssistRestoreModule module, ClassLoader classLoader) {
         ensureVoiceInteractionService(module, TargetIntents.appContext());
+        // Restore a default assistant lost across a reboot before the first gesture
+        // arrives, so the power key works without a manual re-select in Settings.
+        repairAssistant(module, TargetIntents.appContext());
         AssistPipeline pipeline = resolveAssistPipeline(module, classLoader);
         CtsPipeline cts = resolveCtsPipeline(module, classLoader);
         installAssistDispatch(module, classLoader, pipeline, cts);
@@ -256,9 +266,18 @@ final class SystemUiHooks {
         Object dispatch(AssistRestoreModule module, Object assistManager, Bundle args)
                 throws Throwable {
             Object assistInfo = getAssistInfo.invoke(assistManager);
+            Context context = contextOf(assistManager);
             if (assistInfo == null) {
-                module.logWarn("assist_dispatch_skipped reason=no_assistant_configured");
-                return null;
+                // ColorOS can lose the default assistant across a reboot, which makes every
+                // "follow the default assistant" entry silently do nothing until the user
+                // re-selects it in Settings. Restore it from the last assistant that
+                // dispatched and retry instead of dropping the gesture.
+                ComponentName restored = repairAssistant(module, context);
+                if (restored == null) {
+                    module.logWarn("assist_dispatch_skipped reason=no_assistant_configured");
+                    return null;
+                }
+                assistInfo = restored;
             }
             if (!(assistInfo instanceof ComponentName)) {
                 module.logWarn("assist_dispatch_skipped reason=unexpected_assistant_type type="
@@ -266,7 +285,7 @@ final class SystemUiHooks {
                 return null;
             }
             ComponentName assistComponent = (ComponentName) assistInfo;
-            Context context = contextOf(assistManager);
+            rememberAssistant(module, context, assistComponent);
             ensureVoiceInteractionService(module, context);
             Object voiceInteractor = getVoiceInteractorComponentName.invoke(assistManager);
             // ColorOS 17 does not always sync voice_interaction_service with the selected
@@ -422,6 +441,107 @@ final class SystemUiHooks {
             }
         } catch (Throwable t) {
             module.logWarn("voice_interaction_service_repair_failed " + t);
+        }
+    }
+
+    /**
+     * Remembers the assistant that just dispatched, so a later boot that loses the
+     * system default can be repaired from it. Only a component that actually
+     * dispatched is remembered, so the cache always tracks the assistant the user
+     * is really using.
+     */
+    private static void rememberAssistant(
+            AssistRestoreModule module, Context context, ComponentName component) {
+        if (context == null || component == null) {
+            return;
+        }
+        try {
+            ContentResolver resolver = context.getContentResolver();
+            String flattened = component.flattenToString();
+            String cached = Settings.Secure.getString(resolver, SETTING_LAST_ASSISTANT);
+            if (flattened.equals(cached)) {
+                return;
+            }
+            boolean written = false;
+            try {
+                Method putStringForUser = Settings.Secure.class.getMethod(
+                        "putStringForUser", ContentResolver.class, String.class,
+                        String.class, int.class);
+                Object result = putStringForUser.invoke(null, resolver,
+                        SETTING_LAST_ASSISTANT, flattened, -2);
+                written = !Boolean.FALSE.equals(result);
+            } catch (Throwable ignored) {
+                written = Settings.Secure.putString(
+                        resolver, SETTING_LAST_ASSISTANT, flattened);
+            }
+            if (written) {
+                module.logInfo("assistant_remembered component=" + flattened);
+            } else {
+                module.logWarn("assistant_remember_failed component=" + flattened);
+            }
+        } catch (Throwable t) {
+            module.logWarn("assistant_remember_failed " + t);
+        }
+    }
+
+    /**
+     * Restores the system default assistant when ColorOS lost it across a reboot.
+     * Only repairs when the setting is currently empty, and only from an app that
+     * is still installed, so it never overrides an assistant the user deliberately
+     * changed to something else.
+     *
+     * @return the restored component, or {@code null} when there is nothing to restore with
+     */
+    private static ComponentName repairAssistant(
+            AssistRestoreModule module, Context context) {
+        if (context == null) {
+            return null;
+        }
+        try {
+            ContentResolver resolver = context.getContentResolver();
+            String current = Settings.Secure.getString(resolver, SETTING_ASSISTANT);
+            if (current != null && !current.isEmpty()) {
+                // A default is set; nothing to restore. A null getAssistInfo() despite
+                // this is a different problem and is left to the caller.
+                return null;
+            }
+            String cached = Settings.Secure.getString(resolver, SETTING_LAST_ASSISTANT);
+            if (cached == null || cached.isEmpty()) {
+                return null;
+            }
+            ComponentName component = ComponentName.unflattenFromString(cached);
+            if (component == null) {
+                return null;
+            }
+            try {
+                context.getPackageManager().getPackageInfo(component.getPackageName(), 0);
+            } catch (Throwable notInstalled) {
+                module.logWarn("assistant_repair_skipped reason=package_gone package="
+                        + component.getPackageName());
+                return null;
+            }
+            String flattened = component.flattenToString();
+            boolean written = false;
+            try {
+                Method putStringForUser = Settings.Secure.class.getMethod(
+                        "putStringForUser", ContentResolver.class, String.class,
+                        String.class, int.class);
+                Object result = putStringForUser.invoke(null, resolver,
+                        SETTING_ASSISTANT, flattened, -2);
+                written = !Boolean.FALSE.equals(result);
+            } catch (Throwable ignored) {
+                written = Settings.Secure.putString(resolver, SETTING_ASSISTANT, flattened);
+            }
+            if (!written) {
+                module.logWarn("assistant_repair_failed component=" + flattened);
+                return null;
+            }
+            module.logInfo("assistant_repaired component=" + flattened);
+            ensureVoiceInteractionService(module, context);
+            return component;
+        } catch (Throwable t) {
+            module.logWarn("assistant_repair_failed " + t);
+            return null;
         }
     }
 
