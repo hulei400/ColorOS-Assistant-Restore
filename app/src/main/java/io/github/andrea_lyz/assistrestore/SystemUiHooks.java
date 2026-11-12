@@ -156,6 +156,9 @@ final class SystemUiHooks {
         // Restore a default assistant lost across a reboot before the first gesture
         // arrives, so the power key works without a manual re-select in Settings.
         repairAssistant(module, TargetIntents.appContext());
+        // Seed the remembered assistant from the current default on first install, so
+        // the repair has something to restore from even before the first dispatch.
+        seedRememberedAssistant(module, TargetIntents.appContext());
         AssistPipeline pipeline = resolveAssistPipeline(module, classLoader);
         CtsPipeline cts = resolveCtsPipeline(module, classLoader);
         installAssistDispatch(module, classLoader, pipeline, cts);
@@ -481,6 +484,36 @@ final class SystemUiHooks {
             }
         } catch (Throwable t) {
             module.logWarn("assistant_remember_failed " + t);
+        }
+    }
+
+    /**
+     * Seeds the remembered assistant from the current default when the cache is
+     * still empty (fresh install). This makes the repair work on the very first
+     * reboot after installing, instead of needing one successful dispatch first.
+     */
+    private static void seedRememberedAssistant(
+            AssistRestoreModule module, Context context) {
+        if (context == null) {
+            return;
+        }
+        try {
+            ContentResolver resolver = context.getContentResolver();
+            String cached = Settings.Secure.getString(resolver, SETTING_LAST_ASSISTANT);
+            if (cached != null && !cached.isEmpty()) {
+                return;
+            }
+            String current = Settings.Secure.getString(resolver, SETTING_ASSISTANT);
+            if (current == null || current.isEmpty()) {
+                return;
+            }
+            ComponentName component = ComponentName.unflattenFromString(current);
+            if (component == null) {
+                return;
+            }
+            rememberAssistant(module, context, component);
+        } catch (Throwable t) {
+            module.logWarn("assistant_seed_failed " + t);
         }
     }
 
